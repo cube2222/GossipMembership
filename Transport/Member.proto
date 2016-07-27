@@ -1,0 +1,13 @@
+syntax = "proto3";
+package Transport;
+
+message Member {
+    string Address = 1;
+    int64 Heartbeat = 2;
+    int64 Timestamp = 3;
+    bool Alive = 4;
+}
+
+message MemberList {
+    map<string, Member> list = 1;
+}
