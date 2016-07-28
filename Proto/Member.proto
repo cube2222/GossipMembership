@@ -1,5 +1,13 @@
 syntax = "proto3";
-package Transport;
+package gossip;
+
+import "google/protobuf/Empty.proto";
+
+service Node {
+    rpc Ping(MemberList) returns (google.protobuf.Empty) {}
+    rpc Join(Member) returns (MemberList) {}
+    rpc NotifyLeave(Member) returns (google.protobuf.Empty) {}
+}
 
 message Member {
     string Address = 1;
