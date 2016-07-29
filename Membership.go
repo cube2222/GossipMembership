@@ -25,44 +25,61 @@ type cluster struct {
 	nodeTimeout       time.Duration
 	members           gossip.MemberList
 	memberListMutex   sync.RWMutex
+	lastUpdated       []*gossip.Member
+	lastUpdatedMutex  sync.RWMutex
 }
 
+// Creates a new cluster with configuration.
+// ListenAddress is required. It describes on what address gossiping will take place.
 func NewCluster(ListenAddress string) cluster {
 	newCluster := cluster{}.WithListenAddress(ListenAddress)
 	newCluster.members.List = make(map[string]*gossip.Member)
 	return newCluster
 }
 
+// You can change the listen address before starting the cluster.
+// For whatever reason you'd like to do that.
 func (c cluster) WithListenAddress(listenAddress string) cluster {
 	c.listenAddress = listenAddress
 	return c
 }
 
+// This is the address of the cluster we want to join.
+// If not provided, we'll start a new cluster.
 func (c cluster) WithClusterAddress(clusterAddress string) cluster {
 	c.clusterAddress = clusterAddress
 	return c
 }
 
+// The frequency at which we ping other nodes with our member list.
+// This is also our heartbeat frequency.
 func (c cluster) WithPingFrequency(freq time.Duration) cluster {
 	c.pingFrequency = freq
 	return c
 }
 
+// How many nodes to ping whenever we do a ping.
 func (c cluster) WithNodesToPing(amount int) cluster {
 	c.nodesToPing = amount
 	return c
 }
 
+// If we haven't heard from a node for <timeout>. Mark it dead.
 func (c cluster) WithNodeTimeout(timeout time.Duration) cluster {
 	c.nodeTimeout = timeout
 	return c
 }
 
+// The listen address we can get debugging info from.
+// Like the current list of nodes.
+// Current list of nodes available at: <addr>/memberList
 func (c cluster) WithHttpListenAddress(addr string) cluster {
 	c.httpListenAddress = addr
 	return c
 }
 
+// Start the cluster.
+// This time we return a pointer to the actual running cluster.
 func (c cluster) Start() (*cluster, error) {
 	if c.nodesToPing == 0 {
 		c.nodesToPing = 3
@@ -77,7 +94,7 @@ func (c cluster) Start() (*cluster, error) {
 		return &c, errors.New("Listen address must be provided.")
 	}
 
-	c.addSelfToCluster()
+	c.addSelfToLocalMemberList()
 
 	if c.clusterAddress == "" {
 		return &c, c.startCluster()
@@ -86,7 +103,8 @@ func (c cluster) Start() (*cluster, error) {
 	}
 }
 
-func (c *cluster) addSelfToCluster() {
+// Pretty self-descriptive, eh?
+func (c *cluster) addSelfToLocalMemberList() {
 	me := gossip.Member{
 		Address:   c.listenAddress,
 		Heartbeat: 1,
@@ -97,25 +115,14 @@ func (c *cluster) addSelfToCluster() {
 	c.members.List[me.Address] = &me
 }
 
+// Connect to a remote cluster at the cluster address provided.
+// We send them info about ourselves, and get back the current
+// member list.
 func (c *cluster) connectToCluster() error {
 	log.Printf("Connecting to cluster at %s \n", c.clusterAddress+"/join")
 
-	/*data, err := proto.Marshal(c.members.List[c.listenAddress])
-	if err != nil {
-		return err
-	}
-
-	res, err := (&http.Client{Timeout: time.Duration(4 * time.Second)}).Post("http://"+c.clusterAddress+"/join", "", bytes.NewBuffer(data))
-	if err != nil {
-		return err
-	}
-	data, err = ioutil.ReadAll(res.Body)
-	if err != nil {
-		return err
-	}*/
 	c.memberListMutex.RLock()
 	conn, err := grpc.Dial(c.clusterAddress, grpc.WithInsecure(), grpc.WithTimeout(4*time.Second))
-	c.memberListMutex.RUnlock()
 	if err != nil {
 		return err
 	}
@@ -126,6 +133,7 @@ func (c *cluster) connectToCluster() error {
 		return err
 	}
 	conn.Close()
+	c.memberListMutex.RUnlock()
 
 	c.memberListMutex.Lock()
 	for _, item := range clusterMemberList.List {
@@ -288,13 +296,24 @@ func (c *cluster) ping() {
 			}
 			client := gossip.NewNodeClient(conn)
 			_, err = client.Ping(context.Background(), &c.members)
-			time.Sleep(time.Second * 2)
 			conn.Close()
 			wg.Done()
 		}(str)
 	}
 	wg.Wait()
 	c.memberListMutex.RUnlock()
+}
+
+func (c *cluster) GetClusterMembers() []string {
+	curMembers := make([]string, 0, 10)
+	c.memberListMutex.RLock()
+	for _, item := range c.members.List {
+		if item.Alive == true {
+			curMembers = append(curMembers, item.Address)
+		}
+	}
+	c.memberListMutex.RUnlock()
+	return curMembers
 }
 
 func (c *cluster) Ping(ctx context.Context, remoteList *gossip.MemberList) (*google_protobuf.Empty, error) {
