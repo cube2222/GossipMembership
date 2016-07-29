@@ -17,23 +17,24 @@ import (
 )
 
 type cluster struct {
-	listenAddress     string
-	httpListenAddress string
-	clusterAddress    string
-	pingFrequency     time.Duration
-	nodesToPing       int
-	nodeTimeout       time.Duration
-	members           gossip.MemberList
-	memberListMutex   sync.RWMutex
-	lastUpdated       []*gossip.Member
-	lastUpdatedMutex  sync.RWMutex
+	listenAddress           string
+	httpListenAddress       string
+	clusterAddress          string
+	pingFrequency           time.Duration
+	nodesToPing             int
+	nodeTimeout             time.Duration
+	membersToSend           int
+	members                 map[string]*gossip.Member
+	memberListMutex         sync.RWMutex
+	membersLastUpdated      gossip.MemberList
+	membersLastUpdatedMutex sync.RWMutex
 }
 
 // Creates a new cluster with configuration.
 // ListenAddress is required. It describes on what address gossiping will take place.
 func NewCluster(ListenAddress string) cluster {
 	newCluster := cluster{}.WithListenAddress(ListenAddress)
-	newCluster.members.List = make(map[string]*gossip.Member)
+	newCluster.members = make(map[string]*gossip.Member)
 	return newCluster
 }
 
@@ -70,6 +71,12 @@ func (c cluster) WithNodeTimeout(timeout time.Duration) cluster {
 	return c
 }
 
+// The amount of members from our member list to send on each ping.
+func (c cluster) WithMembersToSend(amount int) cluster {
+	c.membersToSend = amount
+	return c
+}
+
 // The listen address we can get debugging info from.
 // Like the current list of nodes.
 // Current list of nodes available at: <addr>/memberList
@@ -81,6 +88,9 @@ func (c cluster) WithHttpListenAddress(addr string) cluster {
 // Start the cluster.
 // This time we return a pointer to the actual running cluster.
 func (c cluster) Start() (*cluster, error) {
+	if c.membersToSend < 1 {
+		c.membersToSend = 4
+	}
 	if c.nodesToPing == 0 {
 		c.nodesToPing = 3
 	}
@@ -94,7 +104,11 @@ func (c cluster) Start() (*cluster, error) {
 		return &c, errors.New("Listen address must be provided.")
 	}
 
+	c.membersLastUpdated.List = make([]*gossip.Member, 0, c.membersToSend)
+
 	c.addSelfToLocalMemberList()
+
+	c.membersLastUpdated.List = append(c.membersLastUpdated.List, c.members[c.listenAddress])
 
 	if c.clusterAddress == "" {
 		return &c, c.startCluster()
@@ -112,7 +126,29 @@ func (c *cluster) addSelfToLocalMemberList() {
 		Alive:     true,
 	}
 
-	c.members.List[me.Address] = &me
+	c.members[me.Address] = &me
+}
+
+func (c *cluster) putIntoMembersLastUpdated(member *gossip.Member) {
+	c.removeFromMembersLastUpdated(member.Address)
+	c.membersLastUpdatedMutex.Lock()
+	if len(c.membersLastUpdated.List) < c.membersToSend {
+		c.membersLastUpdated.List = append(append(c.membersLastUpdated.List[0:1], member), c.membersLastUpdated.List[1:len(c.membersLastUpdated.List)]...)
+	} else {
+		c.membersLastUpdated.List = append(append(c.membersLastUpdated.List[0:1], member), c.membersLastUpdated.List[1:len(c.membersLastUpdated.List)-1]...)
+	}
+	c.membersLastUpdatedMutex.Unlock()
+}
+
+func (c *cluster) removeFromMembersLastUpdated(address string) {
+	c.membersLastUpdatedMutex.Lock()
+	defer c.membersLastUpdatedMutex.Unlock()
+	for index, item := range c.membersLastUpdated.List {
+		if item.Address == address {
+			c.membersLastUpdated.List = append(c.membersLastUpdated.List[0:index], c.membersLastUpdated.List[index+1:len(c.membersLastUpdated.List)]...)
+			return
+		}
+	}
 }
 
 // Connect to a remote cluster at the cluster address provided.
@@ -127,7 +163,7 @@ func (c *cluster) connectToCluster() error {
 		return err
 	}
 	client := gossip.NewNodeClient(conn)
-	clusterMemberList, err := client.Join(context.Background(), c.members.List[c.listenAddress])
+	clusterMemberList, err := client.Join(context.Background(), c.members[c.listenAddress])
 	if err != nil {
 		conn.Close()
 		return err
@@ -138,9 +174,10 @@ func (c *cluster) connectToCluster() error {
 	c.memberListMutex.Lock()
 	for _, item := range clusterMemberList.List {
 		if item.Address != c.listenAddress {
-			c.members.List[item.Address] = item
-			c.members.List[item.Address].Timestamp = time.Now().UnixNano()
+			c.members[item.Address] = item
+			c.members[item.Address].Timestamp = time.Now().UnixNano()
 			log.Printf("New node added when joining: %s \n", item.Address)
+			c.putIntoMembersLastUpdated(item)
 		}
 	}
 	c.memberListMutex.Unlock()
@@ -173,7 +210,7 @@ func (c *cluster) setupHttpHandler() error {
 	m := mux.NewRouter()
 	m.HandleFunc("/listMembers", func(w http.ResponseWriter, r *http.Request) {
 		c.memberListMutex.RLock()
-		for _, item := range c.members.List {
+		for _, item := range c.members {
 			fmt.Fprintf(w, "Address: %s Heartbeat: %v Timestamp: %v Alive: %t\n", item.Address, item.Heartbeat, item.Timestamp, item.Alive)
 		}
 		c.memberListMutex.RUnlock()
@@ -231,19 +268,21 @@ func (c *cluster) setupPinger() {
 func (c *cluster) handleDead() {
 	c.memberListMutex.Lock()
 	nodeToDelete := make([]string, 0)
-	for _, item := range c.members.List {
+	for _, item := range c.members {
 		if time.Now().Sub(time.Unix(0, item.Timestamp)) > c.nodeTimeout {
 			if item.Alive == true {
 				item.Alive = false
 				item.Timestamp = time.Now().UnixNano()
 				log.Printf("Node marked dead by timeout: %s \n", item.Address)
+				c.putIntoMembersLastUpdated(item)
 			} else {
-				nodeToDelete = append(nodeToDelete, item.Address) // Better not delete in palce while for ranging.
+				nodeToDelete = append(nodeToDelete, item.Address) // Better not delete in place while for ranging.
 			}
 		}
 	}
 	for _, addr := range nodeToDelete {
-		delete(c.members.List, addr)
+		delete(c.members, addr) // Delete from members to send list.
+		c.removeFromMembersLastUpdated(addr)
 	}
 	c.memberListMutex.Unlock()
 }
@@ -251,8 +290,8 @@ func (c *cluster) handleDead() {
 func (c *cluster) heartbeat() {
 	// Update this node.
 	c.memberListMutex.Lock()
-	c.members.List[c.listenAddress].Heartbeat += 1
-	c.members.List[c.listenAddress].Timestamp = time.Now().UnixNano()
+	c.members[c.listenAddress].Heartbeat += 1
+	c.members[c.listenAddress].Timestamp = time.Now().UnixNano()
 	c.memberListMutex.Unlock()
 }
 
@@ -261,7 +300,7 @@ func (c *cluster) ping() {
 	// Get a list of pingable candidates.
 	c.memberListMutex.RLock()
 	pingCandidates := make([]string, 0)
-	for _, item := range c.members.List {
+	for _, item := range c.members {
 		if item.Address != c.listenAddress && item.Alive == true {
 			pingCandidates = append(pingCandidates, item.Address)
 		}
@@ -286,7 +325,7 @@ func (c *cluster) ping() {
 
 	// Send pings in parallel
 	wg := sync.WaitGroup{}
-	c.memberListMutex.RLock()
+	c.membersLastUpdatedMutex.RLock()
 	for _, str := range addressesToPing {
 		go func(addr string) {
 			wg.Add(1)
@@ -295,19 +334,20 @@ func (c *cluster) ping() {
 				return
 			}
 			client := gossip.NewNodeClient(conn)
-			_, err = client.Ping(context.Background(), &c.members)
+			_, err = client.Ping(context.Background(), &c.membersLastUpdated)
 			conn.Close()
 			wg.Done()
 		}(str)
 	}
 	wg.Wait()
-	c.memberListMutex.RUnlock()
+	c.membersLastUpdatedMutex.RUnlock()
 }
 
+// Get all the cluster members as a list of addresses as strings. Including us.
 func (c *cluster) GetClusterMembers() []string {
 	curMembers := make([]string, 0, 10)
 	c.memberListMutex.RLock()
-	for _, item := range c.members.List {
+	for _, item := range c.members {
 		if item.Alive == true {
 			curMembers = append(curMembers, item.Address)
 		}
@@ -316,12 +356,13 @@ func (c *cluster) GetClusterMembers() []string {
 	return curMembers
 }
 
+// Called by other nodes each time they ping this node.
 func (c *cluster) Ping(ctx context.Context, remoteList *gossip.MemberList) (*google_protobuf.Empty, error) {
 	c.memberListMutex.Lock()
 	for _, item := range remoteList.List {
-		localItem, ok := c.members.List[item.Address] // Keep in mind, localItem is a pointer.
+		localItem, ok := c.members[item.Address] // Keep in mind, localItem is a pointer.
 		if ok == true {
-			if item.Heartbeat > c.members.List[item.Address].Heartbeat {
+			if item.Heartbeat > c.members[item.Address].Heartbeat {
 				// If remote heartbeat is higher, it's surely more up to date than ours.
 				localItem.Alive = item.Alive
 				localItem.Heartbeat = item.Heartbeat
@@ -329,19 +370,22 @@ func (c *cluster) Ping(ctx context.Context, remoteList *gossip.MemberList) (*goo
 				if localItem.Alive == false {
 					log.Printf("Node marked dead by gossip: %s \n", item.Address)
 				}
+				c.putIntoMembersLastUpdated(localItem)
 
-			} else if item.Heartbeat == c.members.List[item.Address].Heartbeat && localItem.Alive == true && item.Alive == false {
+			} else if item.Heartbeat == c.members[item.Address].Heartbeat && localItem.Alive == true && item.Alive == false {
 				// If remote heartbeat is the same, and remotely this node is dead, it means it's dead but we haven't noticed it yet. Kill it.
 				localItem.Alive = false
 				localItem.Timestamp = time.Now().UnixNano()
 				log.Printf("Node marked dead by gossip: %s \n", item.Address)
+				c.putIntoMembersLastUpdated(localItem)
 			}
 		} else {
-			// If we do not have a node saved, put it into our list, as long as it is alive.
+			// If we do not have a node saved, put it into our list, provided it is alive.
 			if item.Alive == true {
-				c.members.List[item.Address] = item
-				c.members.List[item.Address].Timestamp = time.Now().UnixNano()
+				c.members[item.Address] = item
+				c.members[item.Address].Timestamp = time.Now().UnixNano()
 				log.Printf("New node added by gossip: %s \n", item.Address)
+				c.putIntoMembersLastUpdated(c.members[item.Address])
 			}
 		}
 	}
@@ -349,31 +393,34 @@ func (c *cluster) Ping(ctx context.Context, remoteList *gossip.MemberList) (*goo
 
 	return &google_protobuf.Empty{}, nil
 }
+
+// Called by new nodes to join the cluster on this nodes behalf.
 func (c *cluster) Join(ctx context.Context, nodeToJoin *gossip.Member) (*gossip.MemberList, error) {
 	c.memberListMutex.Lock()
-	c.members.List[nodeToJoin.Address] = nodeToJoin
-	c.members.List[nodeToJoin.Address].Timestamp = time.Now().UnixNano()
+	c.members[nodeToJoin.Address] = nodeToJoin
+	c.members[nodeToJoin.Address].Timestamp = time.Now().UnixNano()
 	c.memberListMutex.Unlock()
 	log.Printf("New node added by join: %s \n", nodeToJoin.Address)
 
 	c.memberListMutex.RLock()
 	response := gossip.MemberList{}
-	response.List = make(map[string]*gossip.Member)
-	for _, item := range c.members.List {
-		response.List[item.Address] = &gossip.Member{item.Address, item.Heartbeat, item.Timestamp, item.Alive}
+	response.List = make([]*gossip.Member, 0, len(c.members))
+	for _, item := range c.members {
+		response.List = append(response.List, &gossip.Member{item.Address, item.Heartbeat, item.Timestamp, item.Alive})
 	}
 	c.memberListMutex.RUnlock()
 
 	return &response, nil
 }
+
+// Called by other nodes to notify about leaving the cluster.
 func (c *cluster) NotifyLeave(ctx context.Context, nodeToRemove *gossip.Member) (*google_protobuf.Empty, error) {
 	c.memberListMutex.Lock()
-	c.members.List[nodeToRemove.Address] = nodeToRemove // He's no more marked as alive, so that'l do it.
-	c.members.List[nodeToRemove.Address].Timestamp = time.Now().UnixNano()
+	c.members[nodeToRemove.Address] = nodeToRemove // He's no more marked as alive, so that'l do it.
+	c.members[nodeToRemove.Address].Timestamp = time.Now().UnixNano()
 	c.memberListMutex.Unlock()
+	c.removeFromMembersLastUpdated(nodeToRemove.Address)
 	log.Printf("Node marked dead by leave: %s \n", nodeToRemove.Address)
 
 	return &google_protobuf.Empty{}, nil
 }
-
-// TODO: Get member list from user point of view.

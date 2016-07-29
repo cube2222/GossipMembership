@@ -17,5 +17,5 @@ message Member {
 }
 
 message MemberList {
-    map<string, Member> list = 1;
+    repeated Member list = 1;
 }
